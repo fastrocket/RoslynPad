@@ -4,9 +4,8 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Linq;
-using System.Windows.Controls;
 using Microsoft.CodeAnalysis;
-using RoslynPad.Utilities;
+using Microsoft.CodeAnalysis.ChangeSignature;
 
 namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
 {
@@ -14,10 +13,10 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
     {
         private readonly ParameterConfiguration _originalParameterConfiguration;
 
-        private readonly ParameterViewModel _thisParameter;
-        private readonly List<ParameterViewModel> _parameterGroup1;
-        private readonly List<ParameterViewModel> _parameterGroup2;
-        private readonly ParameterViewModel _paramsParameter;
+        private readonly ParameterViewModel? _thisParameter;
+        private readonly List<ParameterViewModel> _parametersWithoutDefaultValues;
+        private readonly List<ParameterViewModel> _parametersWithDefaultValues;
+        private readonly ParameterViewModel? _paramsParameter;
         private readonly HashSet<IParameterSymbol> _disabledParameters = new HashSet<IParameterSymbol>();
         private readonly ImmutableArray<SymbolDisplayPart> _declarationParts;
 
@@ -32,7 +31,7 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
                 startingSelectedIndex++;
 
                 _thisParameter = new ParameterViewModel(this, parameters.ThisParameter);
-                _disabledParameters.Add(parameters.ThisParameter);
+                _disabledParameters.Add(parameters.ThisParameter.Symbol);
             }
 
             if (parameters.ParamsParameter != null)
@@ -42,8 +41,8 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
 
             _declarationParts = symbol.ToDisplayParts(_symbolDeclarationDisplayFormat);
 
-            _parameterGroup1 = parameters.ParametersWithoutDefaultValues.Select(p => new ParameterViewModel(this, p)).ToList();
-            _parameterGroup2 = parameters.RemainingEditableParameters.Select(p => new ParameterViewModel(this, p)).ToList();
+            _parametersWithoutDefaultValues = parameters.ParametersWithoutDefaultValues.OfType<ExistingParameter>().Select(p => new ParameterViewModel(this, p)).ToList();
+            _parametersWithDefaultValues = parameters.RemainingEditableParameters.OfType<ExistingParameter>().Select(p => new ParameterViewModel(this, p)).ToList();
             SelectedIndex = startingSelectedIndex;
         }
 
@@ -100,6 +99,7 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
 
         internal void Remove()
         {
+            if (_selectedIndex == null) return;
             AllParameters[_selectedIndex.Value].IsRemoved = true;
             OnPropertyChanged(nameof(AllParameters));
             OnPropertyChanged(nameof(SignatureDisplay));
@@ -110,6 +110,7 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
 
         internal void Restore()
         {
+            if (_selectedIndex == null) return;
             AllParameters[_selectedIndex.Value].IsRemoved = false;
             OnPropertyChanged(nameof(AllParameters));
             OnPropertyChanged(nameof(SignatureDisplay));
@@ -122,9 +123,10 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
         {
             return new ParameterConfiguration(
                 _originalParameterConfiguration.ThisParameter,
-                _parameterGroup1.Where(p => !p.IsRemoved).Select(p => p.ParameterSymbol).ToList(),
-                _parameterGroup2.Where(p => !p.IsRemoved).Select(p => p.ParameterSymbol).ToList(),
-                (_paramsParameter == null || _paramsParameter.IsRemoved) ? null : _paramsParameter.ParameterSymbol);
+                _parametersWithoutDefaultValues.Where(p => !p.IsRemoved).Select(p => (Parameter)new ExistingParameter(p.ParameterSymbol)).ToImmutableArray(),
+                _parametersWithDefaultValues.Where(p => !p.IsRemoved).Select(p => (Parameter)new ExistingParameter(p.ParameterSymbol)).ToImmutableArray(),
+                (_paramsParameter == null || _paramsParameter.IsRemoved) ? null : new ExistingParameter(_paramsParameter.ParameterSymbol),
+                selectedIndex: -1);
         }
 
         private static readonly SymbolDisplayFormat _symbolDeclarationDisplayFormat = new SymbolDisplayFormat(
@@ -147,28 +149,20 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
                 SymbolDisplayParameterOptions.IncludeExtensionThis |
                 SymbolDisplayParameterOptions.IncludeName);
 
-        public TextBlock SignatureDisplay
+        public ImmutableArray<TaggedText> SignatureDisplay
         {
             get
             {
                 // TODO: Should probably use original syntax & formatting exactly instead of regenerating here
-                List<SymbolDisplayPart> displayParts = GetSignatureDisplayParts();
+                var displayParts = GetSignatureDisplayParts();
 
-                var textBlock = displayParts.ToTextBlock();
-
-                foreach (var inline in textBlock.Inlines)
-                {
-                    inline.FontSize = 12;
-                }
-
-                textBlock.IsEnabled = false;
-                return textBlock;
+                return displayParts.ToTaggedText();
             }
         }
 
         internal string TEST_GetSignatureDisplayText()
         {
-            return GetSignatureDisplayParts().Select(p => p.ToString()).Join("");
+            return string.Concat(GetSignatureDisplayParts().Select(p => p.ToString()));
         }
 
         private List<SymbolDisplayPart> GetSignatureDisplayParts()
@@ -205,8 +199,8 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
                     list.Add(_thisParameter);
                 }
 
-                list.AddRange(_parameterGroup1);
-                list.AddRange(_parameterGroup2);
+                list.AddRange(_parametersWithoutDefaultValues);
+                list.AddRange(_parametersWithDefaultValues);
 
                 if (_paramsParameter != null)
                 {
@@ -228,7 +222,7 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
 
                 var index = SelectedIndex.Value;
                 index = _thisParameter == null ? index : index - 1;
-                if (index <= 0 || index == _parameterGroup1.Count || index >= _parameterGroup1.Count + _parameterGroup2.Count)
+                if (index <= 0 || index == _parametersWithoutDefaultValues.Count || index >= _parametersWithoutDefaultValues.Count + _parametersWithDefaultValues.Count)
                 {
                     return false;
                 }
@@ -248,7 +242,7 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
 
                 var index = SelectedIndex.Value;
                 index = _thisParameter == null ? index : index - 1;
-                if (index < 0 || index == _parameterGroup1.Count - 1 || index >= _parameterGroup1.Count + _parameterGroup2.Count - 1)
+                if (index < 0 || index == _parametersWithoutDefaultValues.Count - 1 || index >= _parametersWithoutDefaultValues.Count + _parametersWithDefaultValues.Count - 1)
                 {
                     return false;
                 }
@@ -260,19 +254,21 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
         internal void MoveUp()
         {
             Debug.Assert(CanMoveUp);
+            if (SelectedIndex == null) return;
 
             var index = SelectedIndex.Value;
             index = _thisParameter == null ? index : index - 1;
-            Move(index < _parameterGroup1.Count ? _parameterGroup1 : _parameterGroup2, index < _parameterGroup1.Count ? index : index - _parameterGroup1.Count, -1);
+            Move(index < _parametersWithoutDefaultValues.Count ? _parametersWithoutDefaultValues : _parametersWithDefaultValues, index < _parametersWithoutDefaultValues.Count ? index : index - _parametersWithoutDefaultValues.Count, -1);
         }
 
         internal void MoveDown()
         {
             Debug.Assert(CanMoveDown);
+            if (SelectedIndex == null) return;
 
             var index = SelectedIndex.Value;
             index = _thisParameter == null ? index : index - 1;
-            Move(index < _parameterGroup1.Count ? _parameterGroup1 : _parameterGroup2, index < _parameterGroup1.Count ? index : index - _parameterGroup1.Count, 1);
+            Move(index < _parametersWithoutDefaultValues.Count ? _parametersWithoutDefaultValues : _parametersWithDefaultValues, index < _parametersWithoutDefaultValues.Count ? index : index - _parametersWithoutDefaultValues.Count, 1);
         }
 
         private void Move(List<ParameterViewModel> list, int index, int delta)
@@ -302,7 +298,7 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
         {
             var index = SelectedIndex;
             index = _thisParameter == null ? index : index - 1;
-            return index < _parameterGroup1.Count ? _parameterGroup1 : index < _parameterGroup1.Count + _parameterGroup2.Count ? _parameterGroup2 : new List<ParameterViewModel>();
+            return index < _parametersWithoutDefaultValues.Count ? _parametersWithoutDefaultValues : index < _parametersWithoutDefaultValues.Count + _parametersWithDefaultValues.Count ? _parametersWithDefaultValues : new List<ParameterViewModel>();
         }
 
         public bool IsOkButtonEnabled
@@ -310,18 +306,15 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
             get
             {
                 return AllParameters.Any(p => p.IsRemoved) ||
-                    !_parameterGroup1.Select(p => p.ParameterSymbol).SequenceEqual(_originalParameterConfiguration.ParametersWithoutDefaultValues) ||
-                    !_parameterGroup2.Select(p => p.ParameterSymbol).SequenceEqual(_originalParameterConfiguration.RemainingEditableParameters);
+                    !_parametersWithoutDefaultValues.Select(p => p.Parameter).SequenceEqual(_originalParameterConfiguration.ParametersWithoutDefaultValues) ||
+                    !_parametersWithDefaultValues.Select(p => p.Parameter).SequenceEqual(_originalParameterConfiguration.RemainingEditableParameters);
             }
         }
 
         private int? _selectedIndex;
         public int? SelectedIndex
         {
-            get
-            {
-                return _selectedIndex;
-            }
+            get => _selectedIndex;
 
             set
             {
@@ -344,12 +337,13 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
         {
             private readonly ChangeSignatureDialogViewModel _changeSignatureDialogViewModel;
 
-            public IParameterSymbol ParameterSymbol { get; }
+            public ExistingParameter Parameter { get; }
+            public IParameterSymbol ParameterSymbol => Parameter.Symbol;
 
-            public ParameterViewModel(ChangeSignatureDialogViewModel changeSignatureDialogViewModel, IParameterSymbol parameter)
+            public ParameterViewModel(ChangeSignatureDialogViewModel changeSignatureDialogViewModel, ExistingParameter parameter)
             {
                 _changeSignatureDialogViewModel = changeSignatureDialogViewModel;
-                ParameterSymbol = parameter;
+                Parameter = parameter;
             }
 
             public string Modifier
@@ -371,7 +365,7 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
                     }
 
                     if (_changeSignatureDialogViewModel._thisParameter != null &&
-                        ParameterSymbol == _changeSignatureDialogViewModel._thisParameter.ParameterSymbol)
+                        SymbolEqualityComparer.Default.Equals(ParameterSymbol, _changeSignatureDialogViewModel._thisParameter.ParameterSymbol))
                     {
                         return "this";
                     }
@@ -382,7 +376,7 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
 
             public string Type => ParameterSymbol.Type.ToDisplayString(_parameterDisplayFormat);
 
-            public string Parameter => ParameterSymbol.Name;
+            public string ParameterName => ParameterSymbol.Name;
 
             public string Default
             {
@@ -412,13 +406,13 @@ namespace RoslynPad.Roslyn.LanguageServices.ChangeSignature
                         return true;
                     }
 
-                    if (this == _changeSignatureDialogViewModel._parameterGroup1.LastOrDefault() &&
-                        (_changeSignatureDialogViewModel._parameterGroup2.Any() || _changeSignatureDialogViewModel._paramsParameter != null))
+                    if (this == _changeSignatureDialogViewModel._parametersWithoutDefaultValues.LastOrDefault() &&
+                        (_changeSignatureDialogViewModel._parametersWithDefaultValues.Any() || _changeSignatureDialogViewModel._paramsParameter != null))
                     {
                         return true;
                     }
 
-                    if (this == _changeSignatureDialogViewModel._parameterGroup2.LastOrDefault() &&
+                    if (this == _changeSignatureDialogViewModel._parametersWithDefaultValues.LastOrDefault() &&
                         _changeSignatureDialogViewModel._paramsParameter != null)
                     {
                         return true;

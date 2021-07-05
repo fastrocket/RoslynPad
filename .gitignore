@@ -18,6 +18,7 @@
 x64/
 x86/
 build/
+!/build
 bld/
 [Bb]in/
 [Oo]bj/
@@ -197,3 +198,11 @@ FakesAssemblies/
 
 *.lock.json
 RoslynPad.zip
+/lib
+*.binlog
+
+*.appx
+*.msix
+
+RoslynPad.json
+RoslynPad.nuget.config

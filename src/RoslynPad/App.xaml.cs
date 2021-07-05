@@ -1,14 +1,16 @@
-﻿using System.Windows;
-using RoslynPad.Properties;
+﻿using System;
+using System.Runtime;
 
 namespace RoslynPad
 {
     public partial class App
     {
-        protected override void OnExit(ExitEventArgs e)
+        private const string ProfileFileName = "RoslynPad.jitprofile";
+
+        public App()
         {
-            base.OnExit(e);
-            Settings.Default.Save();
+            ProfileOptimization.SetProfileRoot(AppDomain.CurrentDomain.BaseDirectory!);
+            ProfileOptimization.StartProfile(ProfileFileName);
         }
     }
 }

@@ -1,104 +1,129 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Composition;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Completion;
 using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.Editor;
 
 namespace RoslynPad.Roslyn.Completion.Providers
 {
     [ExportCompletionProvider("ReferenceDirectiveCompletionProvider", LanguageNames.CSharp)]
     internal class ReferenceDirectiveCompletionProvider : AbstractReferenceDirectiveCompletionProvider
     {
-        protected override bool TryGetStringLiteralToken(SyntaxTree tree, int position, out SyntaxToken stringLiteral, CancellationToken cancellationToken)
+        const string NuGetPrefix = "nuget:";
+
+        private static readonly CompletionItemRules s_rules = CompletionItemRules.Create(
+            filterCharacterRules: ImmutableArray<CharacterSetModificationRule>.Empty,
+            commitCharacterRules: ImmutableArray<CharacterSetModificationRule>.Empty,
+            enterKeyRule: EnterKeyRule.Never,
+            selectionBehavior: CompletionItemSelectionBehavior.SoftSelection);
+
+        private readonly INuGetCompletionProvider _nuGetCompletionProvider;
+
+        [ImportingConstructor]
+        public ReferenceDirectiveCompletionProvider([Import(AllowDefault = true)] INuGetCompletionProvider nuGetCompletionProvider)
         {
-            if (IsEntirelyWithinStringLiteral(tree, position, cancellationToken))
+            _nuGetCompletionProvider = nuGetCompletionProvider;
+        }
+
+        private CompletionItem CreateNuGetRoot()
+            => CommonCompletionItem.Create(
+                displayText: NuGetPrefix,
+                displayTextSuffix: "",
+                rules: s_rules,
+                glyph: Microsoft.CodeAnalysis.Glyph.NuGet,
+                sortText: "");
+
+        protected override Task ProvideCompletionsAsync(CompletionContext context, string pathThroughLastSlash)
+        {
+            if (_nuGetCompletionProvider != null &&
+                pathThroughLastSlash.StartsWith(NuGetPrefix, StringComparison.InvariantCultureIgnoreCase))
             {
-                var token = tree.GetRoot(cancellationToken).FindToken(position, true);
-                if (token.Kind() == SyntaxKind.EndOfDirectiveToken || token.Kind() == SyntaxKind.EndOfFileToken)
+                return ProvideNuGetCompletionsAsync(context, pathThroughLastSlash);
+            }
+
+            if (string.IsNullOrEmpty(pathThroughLastSlash))
+            {
+                context.AddItem(CreateNuGetRoot());
+            }
+
+            return base.ProvideCompletionsAsync(context, pathThroughLastSlash);
+        }
+
+        private async Task ProvideNuGetCompletionsAsync(CompletionContext context, string packageIdAndVersion)
+        {
+            var (id, version) = ParseNuGetReference(packageIdAndVersion);
+            var packages = await Task.Run(() => _nuGetCompletionProvider.SearchPackagesAsync(id, exactMatch: version != null, context.CancellationToken), context.CancellationToken).ConfigureAwait(false);
+
+            if (version != null)
+            {
+                if (packages.Count > 0)
                 {
-                    token = token.GetPreviousToken(includeSkipped: true, includeDirectives: true);
+                    var package = packages[0];
+                    var versions = package.Versions;
+                    if (!string.IsNullOrWhiteSpace(version))
+                    {
+                        versions = versions.Where(v => v.StartsWith(version, StringComparison.InvariantCultureIgnoreCase));
+                    }
+
+                    context.AddItems(versions.Select((v, i) =>
+                        CommonCompletionItem.Create(
+                            v,
+                            "",
+                            s_rules,
+                            Microsoft.CodeAnalysis.Glyph.NuGet,
+                            sortText: i.ToString("0000"))));
                 }
-
-                if (token.Kind() == SyntaxKind.StringLiteralToken &&
-                    token.Parent.Kind() == SyntaxKind.ReferenceDirectiveTrivia)
-                {
-                    stringLiteral = token;
-                    return true;
-                }
             }
-
-            stringLiteral = default(SyntaxToken);
-            return false;
+            else
+            {
+                context.AddItems(packages.Select((p, i) =>
+                    CommonCompletionItem.Create(
+                        NuGetPrefix + p.Id + "/",
+                         "",
+                        s_rules,
+                        Microsoft.CodeAnalysis.Glyph.NuGet,
+                        sortText: i.ToString("0000"))));
+            }
         }
 
-        #region SyntaxTreeExtensions
-
-        // TODO: access Microsoft.CodeAnalysis.Workspaces internals and remove this
-
-        public static bool IsKind(SyntaxToken token, SyntaxKind kind1, SyntaxKind kind2)
+        private static (string id, string? version) ParseNuGetReference(string value)
         {
-            return token.Kind() == kind1
-                   || token.Kind() == kind2;
+            string id;
+            string? version;
+
+            var indexOfSlash = value.IndexOf('/');
+            if (indexOfSlash >= 0)
+            {
+                id = value.Substring(NuGetPrefix.Length, indexOfSlash - NuGetPrefix.Length);
+                version = indexOfSlash != value.Length - 1 ? value.Substring(indexOfSlash + 1) : string.Empty;
+            }
+            else
+            {
+                id = value.Substring(NuGetPrefix.Length);
+                version = null;
+            }
+
+            return (id, version);
         }
 
-        public static bool IsKind(SyntaxToken token, SyntaxKind kind1, SyntaxKind kind2, SyntaxKind kind3)
-        {
-            return token.Kind() == kind1
-                   || token.Kind() == kind2
-                   || token.Kind() == kind3;
-        }
+        protected override bool TryGetStringLiteralToken(SyntaxTree tree, int position, out SyntaxToken stringLiteral, CancellationToken cancellationToken) =>
+            tree.TryGetStringLiteralToken(position, SyntaxKind.ReferenceDirectiveTrivia, out stringLiteral, cancellationToken);
+    }
 
-        public static bool IsEntirelyWithinStringLiteral(
-            SyntaxTree syntaxTree, int position, CancellationToken cancellationToken)
-        {
-            var token = syntaxTree.GetRoot(cancellationToken).FindToken(position, findInsideTrivia: true);
+    public interface INuGetCompletionProvider
+    {
+        Task<IReadOnlyList<INuGetPackage>> SearchPackagesAsync(string searchString, bool exactMatch, CancellationToken cancellationToken);
+    }
 
-            // If we ask right at the end of the file, we'll get back nothing. We handle that case
-            // specially for now, though SyntaxTree.FindToken should work at the end of a file.
-            if (IsKind(token, SyntaxKind.EndOfDirectiveToken, SyntaxKind.EndOfFileToken))
-            {
-                token = token.GetPreviousToken(includeSkipped: true, includeDirectives: true);
-            }
+    public interface INuGetPackage
+    {
+        string Id { get; }
 
-            if (token.IsKind(SyntaxKind.StringLiteralToken))
-            {
-                var span = token.Span;
-
-                // cases:
-                // "|"
-                // "|  (e.g. incomplete string literal)
-                return (position > span.Start && position < span.End)
-                       || AtEndOfIncompleteStringOrCharLiteral(token, position, '"');
-            }
-
-            if (IsKind(token, SyntaxKind.InterpolatedStringStartToken, SyntaxKind.InterpolatedStringTextToken,
-                SyntaxKind.InterpolatedStringEndToken))
-            {
-                return token.SpanStart < position && token.Span.End > position;
-            }
-
-            return false;
-        }
-
-        private static bool AtEndOfIncompleteStringOrCharLiteral(SyntaxToken token, int position, char lastChar)
-        {
-            if (!IsKind(token, SyntaxKind.StringLiteralToken, SyntaxKind.CharacterLiteralToken))
-            {
-                throw new ArgumentException("ExpectedStringOrCharLiteral", nameof(token));
-            }
-
-            int startLength = 1;
-            if (token.IsVerbatimStringLiteral())
-            {
-                startLength = 2;
-            }
-
-            return position == token.Span.End &&
-                   (token.Span.Length == startLength ||
-                    (token.Span.Length > startLength && token.ToString().LastOrDefault() != lastChar));
-        }
-
-        #endregion
+        IEnumerable<string> Versions { get; }
     }
 }

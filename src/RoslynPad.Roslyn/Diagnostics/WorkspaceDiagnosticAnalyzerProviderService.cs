@@ -1,33 +1,28 @@
-using System;
-using System.Collections.Generic;
-using System.Collections.Immutable;
 using System.Composition;
-using System.IO;
 using System.Reflection;
 using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.Diagnostics;
+using Microsoft.CodeAnalysis.Host.Mef;
+using Microsoft.CodeAnalysis.Host;
 
 namespace RoslynPad.Roslyn.Diagnostics
 {
-    [Export(typeof(IWorkspaceDiagnosticAnalyzerProviderService))]
-    internal sealed class WorkspaceDiagnosticAnalyzerProviderService : IWorkspaceDiagnosticAnalyzerProviderService
+    [ExportWorkspaceService(typeof(IAnalyzerService), ServiceLayer.Host), Shared]
+    internal sealed class AnalyzerAssemblyLoaderService : IAnalyzerService
     {
-        public IEnumerable<HostDiagnosticAnalyzerPackage> GetHostDiagnosticAnalyzerPackages()
+        public IAnalyzerAssemblyLoader GetLoader()
         {
-            var path = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
-            if (path == null) throw new ArgumentNullException(nameof(path));
-            return new[]
-            {
-                new HostDiagnosticAnalyzerPackage(LanguageNames.CSharp,
-                    ImmutableArray.Create(
-                        Path.Combine(path, "Microsoft.CodeAnalysis.dll"),
-                        Path.Combine(path, "Microsoft.CodeAnalysis.CSharp.dll")))
-            };
+            return SimpleAnalyzerAssemblyLoader.Instance;
         }
+    }
 
-        public IAnalyzerAssemblyLoader GetAnalyzerAssemblyLoader()
+    [Export(typeof(IAnalyzerAssemblyLoader))]
+    internal class SimpleAnalyzerAssemblyLoader : AnalyzerAssemblyLoader
+    {
+        public static IAnalyzerAssemblyLoader Instance { get; } = new SimpleAnalyzerAssemblyLoader();
+
+        protected override Assembly LoadFromPathImpl(string fullPath)
         {
-            return new AnalyzerAssemblyLoader();
+            return Assembly.Load(AssemblyName.GetAssemblyName(fullPath));
         }
     }
 }

@@ -1,121 +1,58 @@
 using System.Collections.Immutable;
-using System.IO;
-using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Completion;
-using Microsoft.CodeAnalysis.Editor.Implementation.IntelliSense.Completion.FileSystem;
-using Microsoft.CodeAnalysis.Host;
-using Microsoft.CodeAnalysis.Options;
 using Microsoft.CodeAnalysis.Scripting.Hosting;
-using Microsoft.CodeAnalysis.Text;
+using Roslyn.Utilities;
+using Microsoft.CodeAnalysis.PooledObjects;
 
 namespace RoslynPad.Roslyn.Completion.Providers
 {
-    internal abstract class AbstractReferenceDirectiveCompletionProvider : CompletionListProvider
+    internal abstract class AbstractReferenceDirectiveCompletionProvider : AbstractDirectivePathCompletionProvider
     {
-        protected abstract bool TryGetStringLiteralToken(SyntaxTree tree, int position, out SyntaxToken stringLiteral, CancellationToken cancellationToken);
+        private static readonly CompletionItemRules s_rules = CompletionItemRules.Create(
+            filterCharacterRules: ImmutableArray<CharacterSetModificationRule>.Empty,
+            commitCharacterRules: ImmutableArray.Create(CharacterSetModificationRule.Create(CharacterSetModificationKind.Replace, GetCommitCharacters())),
+            enterKeyRule: EnterKeyRule.Never,
+            selectionBehavior: CompletionItemSelectionBehavior.HardSelection);
 
-        public override bool IsTriggerCharacter(SourceText text, int characterPosition, OptionSet options)
+        private static readonly char[] s_pathIndicators = new char[] { '/', '\\', ':' };
+
+        private static ImmutableArray<char> GetCommitCharacters()
         {
-            return PathCompletionUtilities.IsTriggerCharacter(text, characterPosition);
-        }
+            var builder = ArrayBuilder<char>.GetInstance();
 
-        private TextSpan GetTextChangeSpan(SyntaxToken stringLiteral, int position)
-        {
-            return PathCompletionUtilities.GetTextChangeSpan(stringLiteral.ToString(), stringLiteral.SpanStart, position);
-        }
-        
-        public override async Task ProduceCompletionListAsync(CompletionListContext context)
-        {
-            var document = context.Document;
-            var position = context.Position;
-            var cancellationToken = context.CancellationToken;
+            builder.Add('"');
 
-            var tree = await document.GetSyntaxTreeAsync(cancellationToken).ConfigureAwait(false);
-
-            // first try to get the #r string literal token.  If we couldn't, then we're not in a #r
-            // reference directive and we immediately bail.
-            SyntaxToken stringLiteral;
-            if (!TryGetStringLiteralToken(tree, position, out stringLiteral, cancellationToken))
+            if (PathUtilities.IsUnixLikePlatform)
             {
-                return;
-            }
-
-            var textChangeSpan = GetTextChangeSpan(stringLiteral, position);
-
-            var gacHelper = new GlobalAssemblyCacheCompletionHelper(this, textChangeSpan, ItemRules.Instance);
-            var referenceResolver = document.Project.CompilationOptions.MetadataReferenceResolver;
-
-            // TODO: https://github.com/dotnet/roslyn/issues/5263
-            // Avoid dependency on a specific resolvers.
-            // The search paths should be provided by specialized workspaces:
-            // - InteractiveWorkspace for interactive window 
-            // - ScriptWorkspace for loose .csx files (we don't have such workspace today)
-            ImmutableArray<string> searchPaths;
-
-            RuntimeMetadataReferenceResolver rtResolver;
-            WorkspaceMetadataFileReferenceResolver workspaceResolver;
-
-            if ((rtResolver = referenceResolver as RuntimeMetadataReferenceResolver) != null)
-            {
-                searchPaths = rtResolver.PathResolver.SearchPaths;
-            }
-            else if ((workspaceResolver = referenceResolver as WorkspaceMetadataFileReferenceResolver) != null)
-            {
-                searchPaths = workspaceResolver.PathResolver.SearchPaths;
+                builder.Add('/');
             }
             else
             {
-                return;
+                builder.Add('/');
+                builder.Add('\\');
             }
 
-            var fileSystemHelper = new FileSystemCompletionHelper(
-                this, textChangeSpan,
-                new CurrentWorkingDirectoryDiscoveryService(Directory.GetCurrentDirectory()),
-                Microsoft.CodeAnalysis.Glyph.OpenFolder,
-                Microsoft.CodeAnalysis.Glyph.Assembly, searchPaths, new[] { ".dll", ".exe" }, path => path.Contains(","), ItemRules.Instance);
+            if (GacFileResolver.IsAvailable)
+            {
+                builder.Add(',');
+            }
 
-            var pathThroughLastSlash = GetPathThroughLastSlash(stringLiteral, position);
-
-            var documentPath = document.Project.IsSubmission ? null : document.FilePath;
-            context.AddItems(gacHelper.GetItems(pathThroughLastSlash, documentPath));
-            context.AddItems(fileSystemHelper.GetItems(pathThroughLastSlash, documentPath));
+            return builder.ToImmutableAndFree();
         }
 
-
-        private static string GetPathThroughLastSlash(SyntaxToken stringLiteral, int position)
+        protected override async Task ProvideCompletionsAsync(CompletionContext context, string pathThroughLastSlash)
         {
-            return PathCompletionUtilities.GetPathThroughLastSlash(stringLiteral.ToString(), stringLiteral.SpanStart, position);
-        }
-
-        private class CurrentWorkingDirectoryDiscoveryService : ICurrentWorkingDirectoryDiscoveryService
-        {
-            public CurrentWorkingDirectoryDiscoveryService(string workingDirectory)
+            if (GacFileResolver.IsAvailable && pathThroughLastSlash.IndexOfAny(s_pathIndicators) < 0)
             {
-                WorkingDirectory = workingDirectory;
+                var gacHelper = new GlobalAssemblyCacheCompletionHelper(s_rules);
+                context.AddItems(await gacHelper.GetItemsAsync(pathThroughLastSlash, context.CancellationToken).ConfigureAwait(false));
             }
 
-            public string WorkingDirectory { get; }
-        }
-
-        private class ItemRules : Microsoft.CodeAnalysis.Completion.CompletionItemRules
-        {
-            public static readonly ItemRules Instance = new ItemRules();
-
-            public override bool? IsCommitCharacter(Microsoft.CodeAnalysis.Completion.CompletionItem completionItem, char ch, string textTypedSoFar)
+            if (pathThroughLastSlash.IndexOf(',') < 0)
             {
-                return PathCompletionUtilities.IsCommitcharacter(completionItem, ch, textTypedSoFar);
-            }
-
-            public override bool? IsFilterCharacter(Microsoft.CodeAnalysis.Completion.CompletionItem completionItem, char ch, string textTypedSoFar)
-            {
-                return PathCompletionUtilities.IsFilterCharacter(completionItem, ch, textTypedSoFar);
-            }
-
-            public override bool? SendEnterThroughToEditor(Microsoft.CodeAnalysis.Completion.CompletionItem completionItem, string textTypedSoFar, OptionSet options)
-            {
-                return PathCompletionUtilities.SendEnterThroughToEditor(completionItem, textTypedSoFar);
+                var helper = GetFileSystemCompletionHelper(context.Document, Microsoft.CodeAnalysis.Glyph.Assembly, ImmutableArray.Create(".dll", ".exe"), s_rules);
+                context.AddItems(await helper.GetItemsAsync(pathThroughLastSlash, context.CancellationToken).ConfigureAwait(false));
             }
         }
     }

@@ -1,30 +1,36 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Composition;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using Avalon.Windows.Controls;
 using RoslynPad.Annotations;
+using RoslynPad.UI;
 
 namespace RoslynPad
 {
     /// <summary>
     /// Interaction logic for SaveDocumentDialog.xaml
     /// </summary>
-    public partial class SaveDocumentDialog : INotifyPropertyChanged
+    [Export(typeof(ISaveDocumentDialog))]
+    internal partial class SaveDocumentDialog : ISaveDocumentDialog, INotifyPropertyChanged
     {
-        private string _documentName;
+        private string? _documentName;
         private bool _showDontSave;
         private InlineModalDialog _dialog;
         private bool _allowNameEdit;
         private string _filePath;
         private SaveResult _result;
 
+#pragma warning disable CS8618 // Non-nullable field is uninitialized.
         public SaveDocumentDialog()
+#pragma warning restore CS8618 // Non-nullable field is uninitialized.
         {
             DataContext = this;
             InitializeComponent();
@@ -42,6 +48,7 @@ namespace RoslynPad
             {
                 SaveButton.Focus();
             }
+            SetSaveButtonStatus();
         }
 
         private void DocumentName_TextChanged(object sender, TextChangedEventArgs e)
@@ -62,38 +69,42 @@ namespace RoslynPad
             }
         }
 
-        public string DocumentName
+        public string? DocumentName
         {
-            get { return _documentName; }
+            get => _documentName;
             set
             {
                 SetProperty(ref _documentName, value);
-                SaveButton.IsEnabled = !string.IsNullOrWhiteSpace(DocumentName);
+                SetSaveButtonStatus();
             }
+        }
+
+        private void SetSaveButtonStatus()
+        {
+            SaveButton.IsEnabled = !AllowNameEdit || !string.IsNullOrWhiteSpace(DocumentName);
         }
 
         public SaveResult Result
         {
-            get { return _result; }
-            private set { SetProperty(ref _result, value); }
+            get => _result; private set => SetProperty(ref _result, value);
         }
 
         public bool AllowNameEdit
         {
-            get { return _allowNameEdit; }
-            set { SetProperty(ref _allowNameEdit, value); }
+            get => _allowNameEdit;
+            set => SetProperty(ref _allowNameEdit, value);
         }
 
         public bool ShowDontSave
         {
-            get { return _showDontSave; }
-            set { SetProperty(ref _showDontSave, value); }
+            get => _showDontSave;
+            set => SetProperty(ref _showDontSave, value);
         }
 
         public string FilePath
         {
-            get { return _filePath; }
-            private set { SetProperty(ref _filePath, value); }
+            get => _filePath;
+            private set => SetProperty(ref _filePath, value);
         }
 
         public Func<string, string> FilePathFactory { get; set; }
@@ -101,13 +112,13 @@ namespace RoslynPad
         public event PropertyChangedEventHandler PropertyChanged;
 
         [NotifyPropertyChangedInvocator]
-        protected virtual void OnPropertyChanged([CallerMemberName] string propertyName = null)
+        protected virtual void OnPropertyChanged([CallerMemberName] string? propertyName = null)
         {
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
         }
 
         [NotifyPropertyChangedInvocator]
-        protected bool SetProperty<T>(ref T field, T value, [CallerMemberName] string propertyName = null)
+        protected bool SetProperty<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
         {
             if (!EqualityComparer<T>.Default.Equals(field, value))
             {
@@ -118,7 +129,7 @@ namespace RoslynPad
             return false;
         }
 
-        public void Show()
+        public Task ShowAsync()
         {
             _dialog = new InlineModalDialog
             {
@@ -126,6 +137,7 @@ namespace RoslynPad
                 Content = this
             };
             _dialog.Show();
+            return Task.CompletedTask;
         }
 
         public void Close()
@@ -135,13 +147,9 @@ namespace RoslynPad
 
         private void PerformSave()
         {
-            if (AllowNameEdit)
+            if (AllowNameEdit && !string.IsNullOrEmpty(DocumentName))
             {
-                if (FilePathFactory == null)
-                {
-                    throw new InvalidOperationException();
-                }
-                FilePath = FilePathFactory(DocumentName);
+                FilePath = FilePathFactory?.Invoke(DocumentName) ?? throw new InvalidOperationException();
                 if (File.Exists(FilePath))
                 {
                     SaveButton.Visibility = Visibility.Collapsed;
@@ -200,12 +208,5 @@ namespace RoslynPad
                 PerformSave();
             }
         }
-    }
-
-    public enum SaveResult
-    {
-        Cancel,
-        Save,
-        DontSave
     }
 }

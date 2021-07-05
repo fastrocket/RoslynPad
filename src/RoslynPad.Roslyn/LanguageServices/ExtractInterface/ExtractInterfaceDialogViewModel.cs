@@ -4,12 +4,17 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Windows.Media;
 using Microsoft.CodeAnalysis;
-using RoslynPad.Utilities;
+using Glyph = RoslynPad.Roslyn.Completion.Glyph;
 
 namespace RoslynPad.Roslyn.LanguageServices.ExtractInterface
 {
+    internal enum InterfaceDestination
+    {
+        CurrentFile,
+        NewFile
+    }
+
     internal class ExtractInterfaceDialogViewModel : NotificationObject
     {
         private readonly object _syntaxFactsService;
@@ -107,10 +112,7 @@ namespace RoslynPad.Roslyn.LanguageServices.ExtractInterface
         private string _interfaceName;
         public string InterfaceName
         {
-            get
-            {
-                return _interfaceName;
-            }
+            get => _interfaceName;
 
             set
             {
@@ -126,11 +128,26 @@ namespace RoslynPad.Roslyn.LanguageServices.ExtractInterface
             $"{(string.IsNullOrEmpty(_defaultNamespace) ? string.Empty : _defaultNamespace + ".")}{_interfaceName.Trim()}{_generatedNameTypeParameterSuffix}"
             ;
 
+        private InterfaceDestination _destination = InterfaceDestination.NewFile;
+        public InterfaceDestination Destination
+        {
+            get { return _destination; }
+            set
+            {
+                if (SetProperty(ref _destination, value))
+                {
+                    OnPropertyChanged(nameof(FileNameEnabled));
+                }
+            }
+        }
+
+        public bool FileNameEnabled => Destination == InterfaceDestination.NewFile;
+
         private string _fileName;
         public string FileName
         {
-            get { return _fileName; }
-            set { SetProperty(ref _fileName, value); }
+            get => _fileName;
+            set => SetProperty(ref _fileName, value);
         }
 
         internal class MemberSymbolViewModel : NotificationObject
@@ -152,13 +169,13 @@ namespace RoslynPad.Roslyn.LanguageServices.ExtractInterface
             private bool _isChecked;
             public bool IsChecked
             {
-                get { return _isChecked; }
-                set { SetProperty(ref _isChecked, value); }
+                get => _isChecked;
+                set => SetProperty(ref _isChecked, value);
             }
 
             public string MemberName => MemberSymbol.ToDisplayString(_memberDisplayFormat);
 
-            public ImageSource Glyph => MemberSymbol.GetGlyph().ToImageSource();
+            public Glyph Glyph => MemberSymbol.GetGlyph();
         }
     }
 }

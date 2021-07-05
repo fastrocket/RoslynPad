@@ -1,165 +1,136 @@
-﻿using System;
-using System.Collections;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Collections.Immutable;
-using System.ComponentModel.Composition.Hosting;
-using System.Composition.Convention;
-using System.Composition.Hosting;
-using System.IO;
-using System.Linq;
-using System.Reflection;
-using System.Text;
-using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Host;
 using Microsoft.CodeAnalysis.Host.Mef;
-using Microsoft.CodeAnalysis.Notification;
-using Microsoft.CodeAnalysis.Text;
-using RoslynPad.Annotations;
-using RoslynPad.Roslyn.Completion;
 using RoslynPad.Roslyn.Diagnostics;
-using RoslynPad.Roslyn.SignatureHelp;
-using RoslynPad.Runtime;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Composition.Hosting;
+using System.Linq;
+using System.Reflection;
+using System.Threading;
+using AnalyzerReference = Microsoft.CodeAnalysis.Diagnostics.AnalyzerReference;
+using AnalyzerFileReference = Microsoft.CodeAnalysis.Diagnostics.AnalyzerFileReference;
 
 namespace RoslynPad.Roslyn
 {
-    public sealed class RoslynHost
+    public class RoslynHost : IRoslynHost
     {
         #region Fields
 
-        private static readonly ImmutableArray<Type> _defaultReferenceAssemblyTypes = new[] {
-            typeof(object),
-            typeof(Thread),
-            typeof(Task),
-            typeof(List<>),
-            typeof(Regex),
-            typeof(StringBuilder),
-            typeof(Uri),
-            typeof(Enumerable),
-            typeof(IEnumerable),
-            typeof(ObjectExtensions),
-            typeof(Path),
-            typeof(Assembly),
-        }.ToImmutableArray();
+        internal static readonly ImmutableArray<string> PreprocessorSymbols =
+            ImmutableArray.CreateRange(new[] { "TRACE", "DEBUG" });
 
-        private static readonly ImmutableArray<Assembly> _defaultReferenceAssemblies =
-            _defaultReferenceAssemblyTypes.Select(x => x.Assembly).Distinct().Concat(new[]
-            {
-                Assembly.Load("System.Runtime, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"),
-                typeof(Microsoft.CSharp.RuntimeBinder.Binder).Assembly,
-            }).ToImmutableArray();
+        internal static readonly ImmutableArray<Assembly> DefaultCompositionAssemblies =
+            ImmutableArray.Create(
+                // Microsoft.CodeAnalysis.Workspaces
+                typeof(WorkspacesResources).Assembly,
+                // Microsoft.CodeAnalysis.CSharp.Workspaces
+                typeof(CSharpWorkspaceResources).Assembly,
+                // Microsoft.CodeAnalysis.Features
+                typeof(FeaturesResources).Assembly,
+                // Microsoft.CodeAnalysis.CSharp.Features
+                typeof(CSharpFeaturesResources).Assembly,
+                // RoslynPad.Roslyn
+                typeof(RoslynHost).Assembly);
 
-        private readonly INuGetProvider _nuGetProvider;
         private readonly ConcurrentDictionary<DocumentId, RoslynWorkspace> _workspaces;
         private readonly ConcurrentDictionary<DocumentId, Action<DiagnosticsUpdatedArgs>> _diagnosticsUpdatedNotifiers;
-        private readonly CSharpParseOptions _parseOptions;
-        private readonly DocumentationProviderServiceFactory.DocumentationProviderService _documentationProviderService;
-        private readonly string _referenceAssembliesPath;
+        private readonly IDocumentationProviderService _documentationProviderService;
         private readonly CompositionHost _compositionContext;
-        private readonly MefHostServices _host;
-
         private int _documentNumber;
 
-        internal ImmutableArray<MetadataReference> DefaultReferences { get; }
+        public ParseOptions ParseOptions { get; }
 
-        internal ImmutableArray<string> DefaultImports { get; }
+        public HostServices HostServices { get; }
+
+        public ImmutableArray<MetadataReference> DefaultReferences { get; }
+
+        public ImmutableArray<string> DefaultImports { get; }
+
+        public ImmutableArray<string> DisabledDiagnostics { get; }
 
         #endregion
 
         #region Constructors
 
-        public RoslynHost(INuGetProvider nuGetProvider = null)
+        public RoslynHost(IEnumerable<Assembly>? additionalAssemblies = null,
+            RoslynHostReferences? references = null,
+            ImmutableArray<string>? disabledDiagnostics = null)
         {
-            _nuGetProvider = nuGetProvider;
+            if (references == null) references = RoslynHostReferences.Empty;
 
             _workspaces = new ConcurrentDictionary<DocumentId, RoslynWorkspace>();
             _diagnosticsUpdatedNotifiers = new ConcurrentDictionary<DocumentId, Action<DiagnosticsUpdatedArgs>>();
 
-            var assemblies = new[]
-            {
-                Assembly.Load("Microsoft.CodeAnalysis"),
-                Assembly.Load("Microsoft.CodeAnalysis.CSharp"),
-                Assembly.Load("Microsoft.CodeAnalysis.Features"),
-                Assembly.Load("Microsoft.CodeAnalysis.CSharp.Features"),
-                typeof(RoslynHost).Assembly,
-            };
+            // ReSharper disable once VirtualMemberCallInConstructor
+            var assemblies = GetDefaultCompositionAssemblies();
 
-            // we can't import this entire assembly due to composition errors
-            // and we don't need all the VS services
-            var editorFeaturesAssembly = Assembly.Load("Microsoft.CodeAnalysis.EditorFeatures");
-            var types = editorFeaturesAssembly.GetTypes().Where(x => x.Namespace == "Microsoft.CodeAnalysis.CodeFixes")
-                .Concat(new[] { typeof(DocumentationProviderServiceFactory) });
+            if (additionalAssemblies != null)
+            {
+                assemblies = assemblies.Concat(additionalAssemblies);
+            }
+
+            var partTypes = assemblies
+                .SelectMany(x => x.DefinedTypes)
+                .Select(x => x.AsType());
 
             _compositionContext = new ContainerConfiguration()
-                .WithAssemblies(MefHostServices.DefaultAssemblies.Concat(assemblies))
-                .WithParts(types)
-                .WithDefaultConventions(new AttributeFilterProvider())
+                .WithParts(partTypes)
                 .CreateContainer();
 
-            _host = MefHostServices.Create(_compositionContext);
+            HostServices = MefHostServices.Create(_compositionContext);
 
-            _parseOptions = new CSharpParseOptions(kind: SourceCodeKind.Script);
+            // ReSharper disable once VirtualMemberCallInConstructor
+            ParseOptions = CreateDefaultParseOptions();
 
-            _referenceAssembliesPath = GetReferenceAssembliesPath();
-            _documentationProviderService = new DocumentationProviderServiceFactory.DocumentationProviderService();
+            _documentationProviderService = GetService<IDocumentationProviderService>();
 
-            DefaultReferences = _defaultReferenceAssemblies.Select(t =>
-                (MetadataReference)MetadataReference.CreateFromFile(t.Location,
-                    documentation: GetDocumentationProvider(t.Location))).ToImmutableArray();
+            DefaultReferences = references.GetReferences(DocumentationProviderFactory);
+            DefaultImports = references.Imports;
 
-            DefaultImports = _defaultReferenceAssemblyTypes.Select(x => x.Namespace).Distinct().ToImmutableArray();
-
+            DisabledDiagnostics = disabledDiagnostics ?? ImmutableArray<string>.Empty;
             GetService<IDiagnosticService>().DiagnosticsUpdated += OnDiagnosticsUpdated;
+        }
 
-            _compositionContext.GetExport<ISemanticChangeNotificationService>().OpenedDocumentSemanticChanged +=
-                OnOpenedDocumentSemanticChanged;
+        public Func<string, DocumentationProvider> DocumentationProviderFactory => _documentationProviderService.GetDocumentationProvider;
 
-            // MEF v1
-            var container = new CompositionContainer(new AggregateCatalog(
-                new AssemblyCatalog(Assembly.Load("Microsoft.CodeAnalysis.EditorFeatures")),
-                new AssemblyCatalog(Assembly.Load("Microsoft.CodeAnalysis.CSharp.EditorFeatures")),
-                new AssemblyCatalog(typeof(RoslynHost).Assembly)),
-                CompositionOptions.DisableSilentRejection | CompositionOptions.IsThreadSafe);
+        protected virtual IEnumerable<Assembly> GetDefaultCompositionAssemblies()
+        {
+            return DefaultCompositionAssemblies;
+        }
 
-            ((AggregateSignatureHelpProvider)GetService<ISignatureHelpProvider>()).Initialize(container);
+        protected virtual ParseOptions CreateDefaultParseOptions()
+        {
+            return new CSharpParseOptions(kind: SourceCodeKind.Script,
+                preprocessorSymbols: PreprocessorSymbols, languageVersion: LanguageVersion.Preview);
+        }
 
-            CompletionService.Initialize(container);
+        public MetadataReference CreateMetadataReference(string location)
+        {
+            return MetadataReference.CreateFromFile(location,
+                documentation: _documentationProviderService.GetDocumentationProvider(location));
         }
 
         private void OnDiagnosticsUpdated(object sender, DiagnosticsUpdatedArgs diagnosticsUpdatedArgs)
         {
-            if (diagnosticsUpdatedArgs?.DocumentId == null) return;
+            var documentId = diagnosticsUpdatedArgs.DocumentId;
+            if (documentId == null) return;
 
-            Action<DiagnosticsUpdatedArgs> notifier;
-            if (_diagnosticsUpdatedNotifiers.TryGetValue(diagnosticsUpdatedArgs.DocumentId, out notifier))
+            if (_diagnosticsUpdatedNotifiers.TryGetValue(documentId, out var notifier))
             {
+                if (diagnosticsUpdatedArgs.Kind == DiagnosticsUpdatedKind.DiagnosticsCreated)
+                {
+                    var remove = diagnosticsUpdatedArgs.Diagnostics.RemoveAll(d => DisabledDiagnostics.Contains(d.Id));
+                    if (remove.Length != diagnosticsUpdatedArgs.Diagnostics.Length)
+                    {
+                        diagnosticsUpdatedArgs = diagnosticsUpdatedArgs.WithDiagnostics(remove);
+                    }
+                }
+
                 notifier(diagnosticsUpdatedArgs);
-            }
-        }
-
-        private class AttributeFilterProvider : AttributedModelProvider
-        {
-            public override IEnumerable<Attribute> GetCustomAttributes(Type reflectedType, MemberInfo member)
-            {
-                return member.GetCustomAttributes().Where(x => !(x is ExtensionOrderAttribute));
-            }
-
-            public override IEnumerable<Attribute> GetCustomAttributes(Type reflectedType, ParameterInfo member)
-            {
-                return member.GetCustomAttributes().Where(x => !(x is ExtensionOrderAttribute));
-            }
-        }
-
-        private async void OnOpenedDocumentSemanticChanged(object sender, Document document)
-        {
-            RoslynWorkspace workspace;
-            if (_workspaces.TryGetValue(document.Id, out workspace))
-            {
-                await workspace.ProcessReferenceDirectives(document).ConfigureAwait(false);
             }
         }
 
@@ -171,7 +142,7 @@ namespace RoslynPad.Roslyn
         #endregion
 
         #region Reference Resolution
-        
+
         internal void AddMetadataReference(ProjectId projectId, AssemblyIdentity assemblyIdentity)
         {
             // TODO
@@ -179,133 +150,201 @@ namespace RoslynPad.Roslyn
 
         public bool HasReference(DocumentId documentId, string text)
         {
-            RoslynWorkspace workspace;
-            if (_workspaces.TryGetValue(documentId, out workspace) && workspace.HasReference(text))
+            if (documentId == null) throw new ArgumentNullException(nameof(documentId));
+
+            if (!_workspaces.TryGetValue(documentId, out var workspace))
             {
-                return true;
+                return false;
             }
-            return _defaultReferenceAssemblies.Any(x => x.GetName().Name == text);
-        }
 
-        private static MetadataReferenceResolver CreateMetadataReferenceResolver(Workspace workspace, string workingDirectory)
-        {
-            var resolver = Activator.CreateInstance(
-                // can't access this type due to a name collision with Scripting assembly
-                // can't use extern alias because of project.json
-                // ReSharper disable once AssignNullToNotNullAttribute
-                Type.GetType("Microsoft.CodeAnalysis.RelativePathResolver, Microsoft.CodeAnalysis.Workspaces"),
-                ImmutableArray<string>.Empty,
-                workingDirectory);
-            return (MetadataReferenceResolver)Activator.CreateInstance(typeof(WorkspaceMetadataFileReferenceResolver),
-                workspace.Services.GetService<IMetadataService>(),
-                resolver);
-        }
-
-        #endregion
-
-        #region Documentation
-
-        private static string GetReferenceAssembliesPath()
-        {
-            var programFiles =
-                Environment.GetFolderPath(Environment.Is64BitOperatingSystem
-                    ? Environment.SpecialFolder.ProgramFilesX86
-                    : Environment.SpecialFolder.ProgramFiles);
-            var path = Path.Combine(programFiles, @"Reference Assemblies\Microsoft\Framework\.NETFramework");
-            var directories = Directory.EnumerateDirectories(path).OrderByDescending(Path.GetFileName);
-            return directories.FirstOrDefault();
-        }
-
-        private DocumentationProvider GetDocumentationProvider(string location)
-        {
-            if (_referenceAssembliesPath != null)
+            if (workspace.CurrentSolution.GetDocument(documentId) is Document document &&
+                document.Project.TryGetCompilation(out var compilation))
             {
-                var fileName = Path.GetFileName(location);
-                // ReSharper disable once AssignNullToNotNullAttribute
-                var referenceLocation = Path.Combine(_referenceAssembliesPath, fileName);
-                if (File.Exists(referenceLocation))
-                {
-                    location = referenceLocation;
-                }
+                return compilation.ReferencedAssemblyNames.Any(a => a.Name == text);
             }
-            return _documentationProviderService.GetDocumentationProvider(location);
+
+            return false;
         }
 
         #endregion
 
         #region Documents
 
+        public void CloseWorkspace(RoslynWorkspace workspace)
+        {
+            if (workspace == null) throw new ArgumentNullException(nameof(workspace));
+
+            foreach (var documentId in workspace.CurrentSolution.Projects.SelectMany(p => p.DocumentIds))
+            {
+                _workspaces.TryRemove(documentId, out _);
+                _diagnosticsUpdatedNotifiers.TryRemove(documentId, out _);
+            }
+
+            using (workspace) { }
+        }
+
+        public virtual RoslynWorkspace CreateWorkspace() => new RoslynWorkspace(HostServices, roslynHost: this);
+
         public void CloseDocument(DocumentId documentId)
         {
-            RoslynWorkspace workspace;
-            if (_workspaces.TryGetValue(documentId, out workspace))
+            if (documentId == null) throw new ArgumentNullException(nameof(documentId));
+
+            if (_workspaces.TryGetValue(documentId, out var workspace))
             {
-                workspace.Dispose();
-                _workspaces.TryRemove(documentId, out workspace);
+                workspace.CloseDocument(documentId);
+
+                var document = workspace.CurrentSolution.GetDocument(documentId);
+
+                if (document != null)
+                {
+                    var solution = document.Project.RemoveDocument(documentId).Solution;
+
+                    if (!solution.Projects.SelectMany(d => d.DocumentIds).Any())
+                    {
+                        _workspaces.TryRemove(documentId, out workspace);
+
+                        using (workspace) { }
+                    }
+                    else
+                    {
+                        workspace.SetCurrentSolution(solution);
+                    }
+                }
             }
-            Action<DiagnosticsUpdatedArgs> notifier;
-            _diagnosticsUpdatedNotifiers.TryRemove(documentId, out notifier);
+
+            _diagnosticsUpdatedNotifiers.TryRemove(documentId, out _);
         }
 
-        public Document GetDocument(DocumentId documentId)
+        public Document? GetDocument(DocumentId documentId)
         {
-            RoslynWorkspace workspace;
-            return _workspaces.TryGetValue(documentId, out workspace) ? workspace.CurrentSolution.GetDocument(documentId) : null;
+            if (documentId == null) throw new ArgumentNullException(nameof(documentId));
+
+            return _workspaces.TryGetValue(documentId, out var workspace)
+                ? workspace.CurrentSolution.GetDocument(documentId)
+                : null;
         }
 
-        public DocumentId AddDocument([NotNull] SourceTextContainer sourceTextContainer, [NotNull] string workingDirectory, Action<DiagnosticsUpdatedArgs> onDiagnosticsUpdated, Action<SourceText> onTextUpdated)
+        public DocumentId AddDocument(DocumentCreationArgs args)
         {
-            if (sourceTextContainer == null) throw new ArgumentNullException(nameof(sourceTextContainer));
+            if (args == null) throw new ArgumentNullException(nameof(args));
+            if (args.SourceTextContainer == null) throw new ArgumentNullException(nameof(args.SourceTextContainer));
 
-            var workspace = new RoslynWorkspace(_host, _nuGetProvider, this);
+            return AddDocument(CreateWorkspace(), args);
+        }
+
+        public DocumentId AddRelatedDocument(DocumentId relatedDocumentId, DocumentCreationArgs args, bool addProjectReference = true)
+        {
+            if (args == null) throw new ArgumentNullException(nameof(args));
+
+            if (!_workspaces.TryGetValue(relatedDocumentId, out var workspace))
+            {
+                throw new ArgumentException("Unable to locate the document's workspace", nameof(relatedDocumentId));
+            }
+
+            if (args.SourceTextContainer == null) throw new ArgumentNullException(nameof(args.SourceTextContainer));
+
+            var documentId = AddDocument(workspace, args,
+                addProjectReference ? workspace.CurrentSolution.GetDocument(relatedDocumentId) : null);
+
+            return documentId;
+        }
+
+        private DocumentId AddDocument(RoslynWorkspace workspace, DocumentCreationArgs args, Document? previousDocument = null)
+        {
+            var solution = workspace.CurrentSolution.AddAnalyzerReferences(GetSolutionAnalyzerReferences());
+            var project = CreateProject(solution, args,
+                CreateCompilationOptions(args, previousDocument == null), previousDocument?.Project);
+            var document = CreateDocument(project, args);
+            var documentId = document.Id;
+
+            workspace.SetCurrentSolution(document.Project.Solution);
+            workspace.OpenDocument(documentId, args.SourceTextContainer);
+
+            _workspaces.TryAdd(documentId, workspace);
+
+            if (args.OnDiagnosticsUpdated != null)
+            {
+                _diagnosticsUpdatedNotifiers.TryAdd(documentId, args.OnDiagnosticsUpdated);
+            }
+
+            var onTextUpdated = args.OnTextUpdated;
             if (onTextUpdated != null)
             {
-                workspace.ApplyingTextChange += (d, s) => onTextUpdated(s);
-            }
-            workspace.Services.GetService<Microsoft.CodeAnalysis.SolutionCrawler.ISolutionCrawlerRegistrationService>()
-                .Register(workspace);
-
-            var currentSolution = workspace.CurrentSolution;
-            var project = CreateSubmissionProject(currentSolution, CreateCompilationOptions(workspace, workingDirectory));
-            var currentDocument = SetSubmissionDocument(workspace, sourceTextContainer, project);
-
-            _workspaces.TryAdd(currentDocument.Id, workspace);
-
-            if (onDiagnosticsUpdated != null)
-            {
-                _diagnosticsUpdatedNotifiers.TryAdd(currentDocument.Id, onDiagnosticsUpdated);
+                workspace.ApplyingTextChange += (d, s) =>
+                {
+                    if (documentId == d) onTextUpdated(s);
+                };
             }
 
-            return currentDocument.Id;
+            return documentId;
         }
 
-        private CSharpCompilationOptions CreateCompilationOptions(Workspace workspace, string workingDirectory)
+        protected virtual IEnumerable<AnalyzerReference> GetSolutionAnalyzerReferences()
         {
-            var metadataReferenceResolver = CreateMetadataReferenceResolver(workspace, workingDirectory);
-            var compilationOptions = new CSharpCompilationOptions(OutputKind.NetModule,
-                usings: DefaultImports,
-                metadataReferenceResolver: metadataReferenceResolver);
+            var loader = GetService<IAnalyzerAssemblyLoader>();
+            yield return new AnalyzerFileReference(typeof(Compilation).Assembly.Location, loader);
+            yield return new AnalyzerFileReference(typeof(CSharpResources).Assembly.Location, loader);
+            yield return new AnalyzerFileReference(typeof(FeaturesResources).Assembly.Location, loader);
+            yield return new AnalyzerFileReference(typeof(CSharpFeaturesResources).Assembly.Location, loader);
+        }
+
+        public void UpdateDocument(Document document)
+        {
+            if (document == null) throw new ArgumentNullException(nameof(document));
+
+            if (!_workspaces.TryGetValue(document.Id, out var workspace))
+            {
+                return;
+            }
+
+            workspace.TryApplyChanges(document.Project.Solution);
+        }
+
+        protected virtual CompilationOptions CreateCompilationOptions(DocumentCreationArgs args, bool addDefaultImports)
+        {
+            var compilationOptions = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
+                usings: addDefaultImports ? DefaultImports : ImmutableArray<string>.Empty,
+                allowUnsafe: true,
+                sourceReferenceResolver: new SourceFileResolver(ImmutableArray<string>.Empty, args.WorkingDirectory),
+                metadataReferenceResolver: new CachedScriptMetadataResolver(args.WorkingDirectory, useCache: true),
+                nullableContextOptions: NullableContextOptions.Enable);
             return compilationOptions;
         }
 
-        private static Document SetSubmissionDocument(RoslynWorkspace workspace, SourceTextContainer textContainer, Project project)
+        protected virtual Document CreateDocument(Project project, DocumentCreationArgs args)
         {
             var id = DocumentId.CreateNewId(project.Id);
-            var solution = project.Solution.AddDocument(id, project.Name, textContainer.CurrentText);
-            workspace.SetCurrentSolution(solution);
-            workspace.OpenDocument(id, textContainer);
-            return solution.GetDocument(id);
+            var solution = project.Solution.AddDocument(id, args.Name ?? project.Name, args.SourceTextContainer.CurrentText);
+            return solution.GetDocument(id)!;
         }
 
-        private Project CreateSubmissionProject(Solution solution, CSharpCompilationOptions compilationOptions)
+        protected virtual Project CreateProject(Solution solution, DocumentCreationArgs args, CompilationOptions compilationOptions, Project? previousProject = null)
         {
-            var name = "Program" + _documentNumber++;
+            var name = args.Name ?? "Program" + Interlocked.Increment(ref _documentNumber);
             var id = ProjectId.CreateNewId(name);
-            solution = solution.AddProject(ProjectInfo.Create(id, VersionStamp.Create(), name, name, LanguageNames.CSharp,
-                parseOptions: _parseOptions,
-                compilationOptions: compilationOptions.WithScriptClassName(name),
-                metadataReferences: DefaultReferences));
-            return solution.GetProject(id);
+
+            var isScript = ParseOptions.Kind == SourceCodeKind.Script;
+
+            if (isScript)
+            {
+                compilationOptions = compilationOptions.WithScriptClassName(name);
+            }
+
+            solution = solution.AddProject(ProjectInfo.Create(
+                id,
+                VersionStamp.Create(),
+                name,
+                name,
+                LanguageNames.CSharp,
+                isSubmission: isScript,
+                parseOptions: ParseOptions,
+                compilationOptions: compilationOptions,
+                metadataReferences: previousProject != null ? ImmutableArray<MetadataReference>.Empty : DefaultReferences,
+                projectReferences: previousProject != null ? new[] { new ProjectReference(previousProject.Id) } : null));
+
+            var project = solution.GetProject(id);
+
+            return project!;
         }
 
         #endregion
